@@ -1,6 +1,6 @@
 # Context Deployment
 
-![Context Deployment](preview.png)
+![Context Deployment](screenshot.png)
 
 Super+right-click the Omarchy desktop to edit what is under the cursor with your default coding agent.
 
