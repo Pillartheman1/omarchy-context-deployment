@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "daniel.desktop-context",
+  "name": "Context Deployment",
+  "version": "1.2.0",
+  "author": "Daniel Klabunde",
+  "license": "MIT",
+  "description": "Super+right-click at the cursor to edit the desktop with your default agent.",
+  "kinds": [
+    "overlay"
+  ],
+  "activation": "on-demand",
+  "keepLoaded": true,
+  "keywords": [
+    "desktop",
+    "context",
+    "agent",
+    "hyprland",
+    "omarchy"
+  ],
+  "entryPoints": {
+    "overlay": "Main.qml"
+  }
+}

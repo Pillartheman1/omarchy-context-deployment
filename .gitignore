@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.bak
+*.bak.*
+
+# runtime state (lives under XDG, but ignore if copied here)
+context.json
+surroundings.png
+last.json
+prompt.md
+undo/
