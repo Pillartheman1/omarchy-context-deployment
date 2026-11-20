@@ -9,9 +9,11 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
-from session import can_continue, can_undo, load_last
+from session import can_continue, can_undo, load_last, state_dir
 
 
 REGION_W = 512
@@ -141,12 +143,43 @@ def point_on_bar(local_x, local_y, monitor):
     return False
 
 
-def window_at(x, y, clients):
+def workspace_id_of(value):
+    if isinstance(value, dict):
+        return workspace_id_of(value.get("id"))
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("-").isdigit():
+            return int(text)
+    return None
+
+
+def current_workspace_id(monitor):
+    """Workspace the user is looking at on this monitor.
+
+    An open special workspace covers the monitor, so it is the current one.
+    """
+    if not isinstance(monitor, dict):
+        return None
+    special = workspace_id_of(monitor.get("specialWorkspace"))
+    if special not in (None, 0):
+        return special
+    return workspace_id_of(monitor.get("activeWorkspace"))
+
+
+def window_at(x, y, clients, *, workspace_id=None):
     hits = []
     for client in clients:
         if not isinstance(client, dict):
             continue
         if not client.get("mapped") or client.get("hidden"):
+            continue
+        if workspace_id is not None and workspace_id_of(client.get("workspace")) != workspace_id:
             continue
         if not point_in_box(x, y, client.get("at"), client.get("size")):
             continue
@@ -182,6 +215,63 @@ def truncate(text, limit=80):
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+FRESH_CONTINUE_HINT = "Keep going in the last agent session with this new click"
+
+
+def context_for_agent(payload: dict, mode: str = "edit") -> dict:
+    """Click context for the agent, without a previous request mixed in.
+
+    Continue still receives the previous request in its own prompt section.
+    A fresh Edit or What is this? gets only this click.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    fresh = mode in {"edit", "inspect", "continue"}
+    if fresh:
+        data = {key: value for key, value in payload.items() if key != "lastPrompt"}
+    else:
+        data = dict(payload)
+    actions = data.get("actions")
+    if fresh and isinstance(actions, list):
+        cleaned = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            item = dict(action)
+            if item.get("actionId") == "continue":
+                item["hint"] = FRESH_CONTINUE_HINT
+            cleaned.append(item)
+        data["actions"] = cleaned
+    return data
+
+
+def allocate_capture(state: Path | None = None) -> tuple[Path, Path]:
+    """Paths for one interaction. A later open never reuses them."""
+    state = state or state_dir()
+    ident = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    folder = state / "captures" / ident
+    return folder / "context.json", folder / "surroundings.png"
+
+
+def discard_capture(context_path: Path, state: Path | None = None) -> bool:
+    """Delete this interaction's capture directory and nothing else."""
+    state = state or state_dir()
+    try:
+        captures = (state / "captures").resolve()
+        target = context_path.resolve()
+    except OSError:
+        return False
+    try:
+        target.relative_to(captures)
+    except ValueError:
+        return False
+    folder = target.parent
+    if folder == captures or folder.parent != captures or folder.is_symlink() or not folder.is_dir():
+        return False
+    shutil.rmtree(folder)
+    return True
 
 
 def actions_for(kind, last):
@@ -256,13 +346,16 @@ def notify(message):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--open", action="store_true")
+    parser.add_argument("--discard", metavar="CONTEXT")
     parser.add_argument("--out")
     parser.add_argument("--screenshot")
     args = parser.parse_args()
+    if args.discard:
+        return 0 if discard_capture(Path(args.discard)) else 1
     if args.open:
-        state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy/desktop-context"
-        args.out = args.out or str(state / "context.json")
-        args.screenshot = args.screenshot or str(state / "surroundings.png")
+        context_path, screenshot_path = allocate_capture(state_dir())
+        args.out = args.out or str(context_path)
+        args.screenshot = args.screenshot or str(screenshot_path)
     elif not args.out or not args.screenshot:
         parser.error("--out and --screenshot are required unless --open")
 
@@ -290,7 +383,7 @@ def capture_and_emit(args) -> int:
         clients = []
 
     monitor = monitor_at(x, y, monitors)
-    window = window_at(x, y, clients)
+    window = window_at(x, y, clients, workspace_id=current_workspace_id(monitor))
     edges = bar_edges(monitor)
     local_x = x - (as_int(monitor.get("x")) if monitor else 0)
     local_y = y - (as_int(monitor.get("y")) if monitor else 0)
@@ -344,7 +437,9 @@ def capture_and_emit(args) -> int:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    # The file is what an agent reads. The menu gets lastPrompt separately.
+    stored = context_for_agent(payload)
+    out.write_text(json.dumps(stored, indent=2) + "\n", encoding="utf-8")
 
     # Summon IPC gets a small UI payload. The agent still reads the full file.
     ui = {

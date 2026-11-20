@@ -38,7 +38,7 @@ inspect)
   ;;
 undo)
   if python3 "$scripts_dir/session.py" restore; then
-    omarchy notification send -g "󰕍" "Context Deployment" "Restored config from before the last edit"
+    omarchy notification send -g "󰕍" "Context Deployment" "Restored the files changed by the last edit"
     exit 0
   fi
   omarchy notification send -u critical -g "󰅚" "Context Deployment" "Undo failed. The last snapshot is unchanged."
@@ -68,10 +68,46 @@ for key, dest in (("prompt", "last_prompt"), ("caption", "last_caption"), ("last
 ')"
 fi
 
+embed_context() {
+  python3 - "$scripts_dir" "$context_json" "$1" <<'PY'
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from context import context_for_agent
+
+with open(sys.argv[2], encoding="utf-8") as handle:
+    payload = json.load(handle)
+if not isinstance(payload, dict):
+    payload = {}
+json.dump(context_for_agent(payload, sys.argv[3]), sys.stdout, indent=2)
+sys.stdout.write("\n")
+PY
+}
+
 write_screenshot() {
   if [[ -n "$screenshot" && -f "$screenshot" ]]; then
     printf '\nA screenshot of the area around the click is at:\n%s\n\nRead that image first so you can see what they clicked on.\n' "$screenshot"
   fi
+}
+
+start_watch() {
+  local ready="$state_dir/watch.ready"
+  rm -f "$ready"
+  setsid python3 "$scripts_dir/session.py" watch --ready "$ready" >/dev/null 2>&1 </dev/null &
+  local _try
+  for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [[ -f $ready ]] && break
+    sleep 0.05
+  done
+}
+
+record_or_stop() {
+  if python3 "$scripts_dir/session.py" record "$@"; then
+    return 0
+  fi
+  omarchy notification send -u critical -g "󰅚" "Context Deployment" "Could not save a restore point, so the edit was not started." || true
+  exit 1
 }
 
 case "$mode" in
@@ -81,11 +117,12 @@ edit)
     printf '%s\n\n' 'The user Super+right-clicked the desktop and chose Edit. Treat this as an operating-system customization request. Use the omarchy skill. Change only what the request and the clicked area call for. Prefer ~/.config edits; never edit /usr/share/omarchy/.'
     printf 'User request:\n%s\n\n' "$user_prompt"
     printf 'Click context JSON:\n```json\n'
-    cat "$context_json"
-    printf '\n```\n'
+    embed_context edit
+    printf '```\n'
     write_screenshot
   } >"$prompt_file"
-  python3 "$scripts_dir/session.py" record --mode edit --prompt="$user_prompt" --context "$context_json" --snapshot
+  record_or_stop --mode edit --prompt="$user_prompt" --context "$context_json" --snapshot
+  start_watch
   exec "$scripts_dir/launch-agent.sh" "$prompt_file"
   ;;
 inspect)
@@ -93,8 +130,8 @@ inspect)
     printf '%s\n\n' '/omarchy'
     printf '%s\n\n' 'The user Super+right-clicked the desktop and chose "What is this?". Identify what they clicked on and explain how they could change it. Use the omarchy skill. Do not edit any files. Do not run commands that change system state. Reading config and the screenshot is fine.'
     printf 'Click context JSON:\n```json\n'
-    cat "$context_json"
-    printf '\n```\n'
+    embed_context inspect
+    printf '```\n'
     write_screenshot
   } >"$prompt_file"
   python3 "$scripts_dir/session.py" record --mode inspect --prompt="What is this?" --context "$context_json"
@@ -113,8 +150,8 @@ continue)
     fi
     printf 'New user request:\n%s\n\n' "$user_prompt"
     printf 'New click context JSON:\n```json\n'
-    cat "$context_json"
-    printf '\n```\n'
+    embed_context continue
+    printf '```\n'
     write_screenshot
   } >"$prompt_file"
   # First mutating continue after an inspect needs a snapshot; later
@@ -123,7 +160,8 @@ continue)
   if ! python3 "$scripts_dir/session.py" can-undo; then
     snapshot_flag=(--snapshot)
   fi
-  python3 "$scripts_dir/session.py" record --mode continue --prompt="$user_prompt" --context "$context_json" "${snapshot_flag[@]}"
+  record_or_stop --mode continue --prompt="$user_prompt" --context "$context_json" "${snapshot_flag[@]}"
+  start_watch
   exec "$scripts_dir/launch-agent.sh" "$prompt_file"
   ;;
 esac
