@@ -34,7 +34,16 @@ def last_path() -> Path:
     return state_dir() / "last.json"
 
 
+def generations_root() -> Path:
+    return state_dir() / "undo" / "generations"
+
+
 def snapshot_dir() -> Path:
+    recorded = load_last().get("snapshotDir")
+    if isinstance(recorded, str) and recorded:
+        path = Path(recorded)
+        if path.is_dir():
+            return path
     return state_dir() / "undo" / "snapshot"
 
 
@@ -239,74 +248,72 @@ def session_lock():
         handle.close()
 
 
-def publish_snapshot(staging: Path) -> Path | None:
-    """Swap in a finished snapshot. Return the previous directory, still on disk.
-
-    The caller deletes that backup only after session metadata is saved. A failed
-    swap puts the previous directory back.
-    """
-    target = snapshot_dir()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    backup = target.parent / f".snapshot-backup-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    with session_lock():
-        moved = False
-        try:
-            if target.exists():
-                _rename(target, backup)
-                moved = True
-            _rename(staging, target)
-        except Exception:
-            if moved and backup.exists() and not target.exists():
-                try:
-                    _rename(backup, target)
-                except OSError:
-                    pass
-            raise
-    if moved and backup.exists():
-        return backup
-    return None
-
-
-def discard_backup(backup: Path | None) -> None:
-    if backup is not None and backup.exists():
-        shutil.rmtree(backup, ignore_errors=True)
-
-
-def rollback_backup(backup: Path | None) -> None:
-    """Put the previous restore point back. Used when metadata never commits."""
-    if backup is None or not backup.exists():
-        return
-    target = snapshot_dir()
-    with session_lock():
-        if not backup.exists():
-            return
-        if target.exists():
-            shutil.rmtree(target)
-        _rename(backup, target)
-
-
-def stage_snapshot() -> tuple[Path, Path | None]:
-    """Publish a snapshot and keep the previous restore point until the caller commits."""
-    parent = snapshot_dir().parent
+def build_staging() -> Path:
+    parent = state_dir() / "undo"
     parent.mkdir(parents=True, exist_ok=True)
-    staging = parent / f".snapshot-staging-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
+    staging = parent / f".staging-{new_id()}"
+    staging.mkdir()
     try:
         populate_snapshot(staging)
-        backup = publish_snapshot(staging)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return staging
+
+
+def _paths_match(left, right) -> bool:
+    if not left or not right:
+        return False
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return str(left) == str(right)
+
+
+def activate_generation(staging: Path, update: dict | None) -> dict:
+    """Publish one snapshot directory that already holds its session metadata.
+
+    The previous generation is never moved. A failed pointer update deletes only
+    this directory, so another edit's published snapshot stays in place.
+    """
+    final = generations_root() / new_id()
+    record = dict(load_last())
+    if update:
+        record.update(update)
+        record["canUndo"] = True
+        record["snapshotAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    record["snapshotDir"] = str(final)
+    record["version"] = 1
+    record["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _write_json(staging / "session.json", record)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _rename(staging, final)
     except Exception:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
         raise
-    return snapshot_dir(), backup
+    try:
+        if update is None:
+            return save_last({"snapshotDir": str(final)}, keep_undo=True)
+        return save_last(
+            {
+                **update,
+                "canUndo": True,
+                "snapshotDir": str(final),
+                "snapshotAt": record["snapshotAt"],
+            },
+            keep_undo=False,
+        )
+    except Exception:
+        if not _paths_match(load_last().get("snapshotDir"), final):
+            shutil.rmtree(final, ignore_errors=True)
+        raise
 
 
 def take_snapshot() -> Path:
-    snap, backup = stage_snapshot()
-    discard_backup(backup)
-    return snap
+    with session_lock():
+        return Path(activate_generation(build_staging(), None)["snapshotDir"])
 
 
 def read_change_file(path: Path) -> dict:
@@ -382,16 +389,19 @@ def seal_session(session_path: Path, attributed: set[str] | None = None) -> list
         records = read_records(changes_path)
         if data.get("sealed"):
             return sorted(records)
-        stored = {
-            item
-            for item in (data.get("observed") or [])
-            if isinstance(item, str) and safe_rel(item)
-        }
-        owned = stored if attributed is None else stored | owned
-        live = collect_manifest()["files"]
+        stored_hashes: dict[str, str | None] = {}
+        raw_observed = data.get("observed") or {}
+        if isinstance(raw_observed, dict):
+            for rel, digest in raw_observed.items():
+                if isinstance(rel, str) and safe_rel(rel) and (digest is None or isinstance(digest, str)):
+                    stored_hashes[rel] = digest
+        owned_hashes = dict(stored_hashes)
+        if attributed is not None:
+            live = collect_manifest()["files"]
+            for rel in owned:
+                owned_hashes[rel] = live.get(rel) if isinstance(live.get(rel), str) else None
         manifest = snapshot_manifest_files(snap)
-        for rel in sorted(owned):
-            after = live.get(rel) if isinstance(live.get(rel), str) else None
+        for rel, after in sorted(owned_hashes.items()):
             if rel in records:
                 records[rel]["after"] = after
                 continue
@@ -530,18 +540,8 @@ def record_session(
     if pause:
         time.sleep(float(pause))
     if snapshot:
-        backup = None
-        try:
-            snap, backup = stage_snapshot()
-            update["canUndo"] = True
-            update["snapshotDir"] = str(snap)
-            update["snapshotAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            saved = save_last(update, keep_undo=False)
-        except Exception:
-            rollback_backup(backup)
-            raise
-        discard_backup(backup)
-        return saved
+        with session_lock():
+            return activate_generation(build_staging(), update)
     if mode == "continue" and can_undo():
         begin_followup_session(Path(load_last().get("snapshotDir") or snapshot_dir()))
     return save_last(update, keep_undo=True)
@@ -654,11 +654,47 @@ def rel_for_fd_target(target: str, index: dict[str, str]) -> str | None:
     return None
 
 
-def open_tracked_files(pids: set[int], proc_root: Path | None = None, index: dict[str, str] | None = None) -> set[str]:
-    """Tracked files currently open by these processes, including temp siblings."""
+def fd_is_writable(proc_root: Path, pid: int, name: str) -> bool:
+    """True only when fdinfo shows a write-mode open. Missing flags are not a write."""
+    info = proc_root / str(pid) / "fdinfo" / name
+    try:
+        text = info.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        if not line.startswith("flags:"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return False
+        try:
+            flags = int(parts[1], 8)
+        except ValueError:
+            return False
+        return (flags & 0o3) != 0
+    return False
+
+
+def hash_for_write(rel: str, fd_target: str, index: dict[str, str]) -> str | None:
+    cleaned = fd_target.split(" (deleted)", 1)[0]
+    if cleaned in index and index[cleaned] == rel:
+        return content_token(Path(cleaned))
+    temp = Path(cleaned)
+    if temp.is_symlink() or temp.is_file():
+        token = content_token(temp)
+        if token is not None:
+            return token
+    for full, mapped in index.items():
+        if mapped == rel:
+            return content_token(Path(full))
+    return content_token(config_root() / rel)
+
+
+def writable_observations(pids: set[int], proc_root: Path | None = None, index: dict[str, str] | None = None) -> dict[str, str | None]:
+    """Content seen while the agent held a write-mode fd. Read-only opens are ignored."""
     proc_root = proc_root or Path("/proc")
     index = tracked_index() if index is None else index
-    found: set[str] = set()
+    found: dict[str, str | None] = {}
     for pid in pids:
         fd_dir = proc_root / str(pid) / "fd"
         if not fd_dir.is_dir():
@@ -668,13 +704,19 @@ def open_tracked_files(pids: set[int], proc_root: Path | None = None, index: dic
         except OSError:
             continue
         for entry in entries:
+            if not fd_is_writable(proc_root, pid, entry.name):
+                continue
             try:
                 target = os.readlink(entry)
             except OSError:
                 continue
             rel = rel_for_fd_target(target, index)
-            if rel:
-                found.add(rel)
+            if not rel:
+                continue
+            digest = hash_for_write(rel, target, index)
+            if rel in found and digest is None and found[rel] is not None:
+                continue
+            found[rel] = digest
     return found
 
 
@@ -696,16 +738,36 @@ def agent_window_pids(clients) -> set[int]:
 
 
 def files_touched_by_clients(clients, proc_root: Path | None = None) -> set[str]:
+    return set(agent_write_observations(clients, proc_root))
+
+
+def agent_write_observations(clients, proc_root: Path | None = None) -> dict[str, str | None]:
     roots = agent_window_pids(clients)
     if not roots:
-        return set()
-    return open_tracked_files(descendant_pids(roots, proc_root), proc_root)
+        return {}
+    return writable_observations(descendant_pids(roots, proc_root), proc_root)
 
 
-def remember_observed(session_path: Path, paths: set[str]) -> None:
-    if not paths or not session_path.is_file():
+def normalize_observations(found) -> dict[str, str | None]:
+    if isinstance(found, dict):
+        observations = {}
+        for rel, digest in found.items():
+            if isinstance(rel, str) and safe_rel(rel) and (digest is None or isinstance(digest, str)):
+                observations[rel] = digest
+        return observations
+    live = collect_manifest()["files"]
+    observations = {}
+    for rel in found or []:
+        if isinstance(rel, str) and safe_rel(rel):
+            digest = live.get(rel)
+            observations[rel] = digest if isinstance(digest, str) else None
+    return observations
+
+
+def remember_observed(session_path: Path, observations: dict[str, str | None]) -> None:
+    if not observations or not session_path.is_file():
         return
-    fresh = {rel for rel in paths if isinstance(rel, str) and safe_rel(rel)}
+    fresh = normalize_observations(observations)
     if not fresh:
         return
     with session_lock():
@@ -717,15 +779,16 @@ def remember_observed(session_path: Path, paths: set[str]) -> None:
             return
         if not isinstance(data, dict) or data.get("sealed"):
             return
-        current = {
-            item
-            for item in (data.get("observed") or [])
-            if isinstance(item, str) and safe_rel(item)
-        }
-        merged = current | fresh
-        if merged == current:
+        current: dict[str, str | None] = {}
+        raw = data.get("observed") or {}
+        if isinstance(raw, dict):
+            for rel, digest in raw.items():
+                if isinstance(rel, str) and safe_rel(rel) and (digest is None or isinstance(digest, str)):
+                    current[rel] = digest
+        current.update(fresh)
+        if current == raw:
             return
-        data["observed"] = sorted(merged)
+        data["observed"] = current
         _write_json(session_path, data)
 
 
@@ -750,7 +813,6 @@ def watch_until_done(
     if known is None:
         known = agent_addresses(clients_fn())
     seen: set[str] = set()
-    attributed: set[str] = set()
     polls = 0
     while session_path.exists() and not session_sealed(session_path):
         if max_polls is not None and polls >= max_polls:
@@ -758,14 +820,15 @@ def watch_until_done(
         polls += 1
         clients = clients_fn()
         if observe_fn is not None:
-            found = set(observe_fn(clients) or [])
+            found = observe_fn(clients) or {}
         else:
-            found = files_touched_by_clients(clients)
-        attributed |= found
-        remember_observed(session_path, found)
+            found = agent_write_observations(clients)
+        remember_observed(session_path, normalize_observations(found))
         seen, done = watch_should_seal(known, seen, agent_addresses(clients))
         if done:
-            seal_session(session_path, attributed=attributed)
+            # Seal the hashes captured while a write fd was open, not the
+            # bytes sitting on disk after the window has closed.
+            seal_session(session_path)
             return True
         sleep_fn(poll)
     return False

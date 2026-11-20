@@ -23,6 +23,7 @@ notify() {
 }
 
 prompt=$(cat "$prompt_file")
+rm -f -- "$prompt_file"
 
 # omarchy-agent relocates $HOME launches into ~/Work. Stay in ~/.config so
 # desktop edits resolve without that hop.

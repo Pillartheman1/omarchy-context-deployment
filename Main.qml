@@ -606,7 +606,7 @@ Item {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "Restore files from the last agent edit? Files you changed again are kept."
+              text: "Restore files the agent wrote? Files it only read, and files you changed again, stay as they are."
               color: root.foreground
               opacity: 0.72
               font.family: root.fontFamily

@@ -166,15 +166,11 @@ def test_publish_failure_restores_previous_directory():
             take_snapshot()
             _write(home, "hypr/a.conf", "v2")
             original = session._rename
-            calls = {"n": 0}
 
-            def flaky(src, dst):
-                calls["n"] += 1
-                if calls["n"] == 2:
-                    raise OSError("swap failed")
-                original(src, dst)
+            def boom(src, dst):
+                raise OSError("swap failed")
 
-            session._rename = flaky
+            session._rename = boom
             try:
                 try:
                     take_snapshot()
@@ -185,10 +181,9 @@ def test_publish_failure_restores_previous_directory():
             finally:
                 session._rename = original
             assert (snapshot_dir() / "files" / "hypr" / "a.conf").read_text(encoding="utf-8") == "v1"
-            parent = snapshot_dir().parent
-            names = [path.name for path in parent.iterdir()]
-            assert snapshot_dir().name in names
-            assert not any(name.startswith(".snapshot-") for name in names)
+            undo = snapshot_dir().parents[1]
+            names = [path.name for path in undo.iterdir()]
+            assert not any(name.startswith(".staging-") or name.startswith(".snapshot-") for name in names)
 
 
 def test_watch_seals_when_its_agent_window_closes():
@@ -266,6 +261,9 @@ def test_agent_process_fds_do_not_include_other_files(tmp_path=None):
             os_symlink = __import__("os").symlink
             os_symlink(str(agent.resolve()), child / "fd" / "4")
             os_symlink(str(agent.resolve()) + ".tmp", child / "fd" / "5")
+            (child / "fdinfo").mkdir()
+            (child / "fdinfo" / "4").write_text("flags:\t0100001\n", encoding="utf-8")
+            (child / "fdinfo" / "5").write_text("flags:\t0100002\n", encoding="utf-8")
             clients = [{"class": "org.omarchy.agent", "pid": 4242, "address": "0x1"}]
             assert files_touched_by_clients(clients, proc_root=proc) == {"hypr/agent.conf"}
 
@@ -297,6 +295,112 @@ def test_metadata_save_failure_keeps_the_previous_restore_point():
             assert (snapshot_dir() / "files" / "hypr" / "a.conf").read_text(encoding="utf-8") == "v1"
             names = [path.name for path in snapshot_dir().parent.iterdir()]
             assert not any(name.startswith(".snapshot-") for name in names)
+
+
+def test_read_only_open_is_not_an_agent_edit():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            agent = _write(home, "hypr/agent.conf", "agent")
+            user = _write(home, "hypr/user.conf", "user")
+            proc = Path(tmp) / "proc"
+            pid = proc / "50"
+            (pid / "fd").mkdir(parents=True)
+            (pid / "fdinfo").mkdir()
+            (pid / "stat").write_text("50 (claude) S 1 0\n", encoding="utf-8")
+            os_symlink = __import__("os").symlink
+            os_symlink(str(agent.resolve()), pid / "fd" / "3")
+            os_symlink(str(user.resolve()), pid / "fd" / "4")
+            (pid / "fdinfo" / "3").write_text("flags:\t0100000\n", encoding="utf-8")
+            (pid / "fdinfo" / "4").write_text("flags:\t0100001\n", encoding="utf-8")
+            clients = [{"class": "org.omarchy.agent", "pid": 50, "address": "0x1"}]
+            assert files_touched_by_clients(clients, proc_root=proc) == {"hypr/user.conf"}
+
+
+def test_unidentified_writer_is_left_out_of_undo():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            edited = _write(home, "hypr/edited.conf", "original")
+            take_snapshot()
+            edited.write_text("user-only", encoding="utf-8")
+            seal_session(active_session_path(snapshot_dir()))
+            assert restore_snapshot() == []
+            assert edited.read_text(encoding="utf-8") == "user-only"
+
+
+def test_user_edit_before_close_is_kept():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            edited = _write(home, "hypr/edited.conf", "original")
+            take_snapshot()
+            edited.write_text("agent-version", encoding="utf-8")
+            agent_hash = session.content_token(edited)
+            state = {"n": 0}
+
+            def clients():
+                state["n"] += 1
+                if state["n"] < 3:
+                    return [{"class": "org.omarchy.agent", "address": "0xagent", "pid": 9}]
+                return []
+
+            def observe(_clients):
+                if state["n"] == 1:
+                    return {"hypr/edited.conf": agent_hash}
+                if state["n"] == 2:
+                    edited.write_text("user-version", encoding="utf-8")
+                return {}
+
+            assert watch_until_done(
+                active_session_path(snapshot_dir()),
+                clients,
+                known=set(),
+                sleep_fn=lambda _seconds: None,
+                observe_fn=observe,
+            )
+            conflicts = restore_snapshot()
+            assert edited.read_text(encoding="utf-8") == "user-version"
+            assert conflicts == ["hypr/edited.conf"]
+
+
+def test_overlapping_metadata_failure_keeps_the_other_edit():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            target = _write(home, "hypr/a.conf", "v1")
+            _record(home, "first", snapshot=True)
+            original = session.save_last
+
+            def hook(update, keep_undo=False):
+                session.save_last = original
+                target.write_text("v-other", encoding="utf-8")
+                staging = session.build_staging()
+                session.activate_generation(
+                    staging,
+                    {
+                        "lastMode": "edit",
+                        "prompt": "other-edit",
+                        "caption": "Desk",
+                        "kind": "desktop",
+                        "contextPath": "",
+                        "screenshot": "",
+                        "canContinue": True,
+                    },
+                )
+                raise OSError("metadata")
+
+            session.save_last = hook
+            try:
+                target.write_text("v-this", encoding="utf-8")
+                try:
+                    _record(home, "this-edit", snapshot=True)
+                except OSError as exc:
+                    assert "metadata" in str(exc)
+                else:
+                    raise AssertionError("metadata save should have failed")
+            finally:
+                session.save_last = original
+            last = load_last()
+            assert last["prompt"] == "other-edit"
+            assert last["canUndo"] is True
+            assert (snapshot_dir() / "files" / "hypr" / "a.conf").read_text(encoding="utf-8") == "v-other"
 
 
 def test_existing_agent_window_does_not_seal_this_edit():
