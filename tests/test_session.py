@@ -16,6 +16,7 @@ from session import (  # noqa: E402
     active_session_path,
     agent_addresses,
     begin_followup_session,
+    files_touched_by_clients,
     load_last,
     record_session,
     restore_snapshot,
@@ -57,7 +58,10 @@ def test_restore_reverts_only_files_changed_before_seal():
             take_snapshot()
             edited.write_text("agent-edit", encoding="utf-8")
             created = _write(home, "hypr/created.conf", "agent-created")
-            seal_session(active_session_path(snapshot_dir()))
+            seal_session(
+                active_session_path(snapshot_dir()),
+                attributed={"hypr/edited.conf", "hypr/created.conf"},
+            )
             untouched.write_text("independent-later", encoding="utf-8")
             backup.write_text("independent-bak", encoding="utf-8")
             _write(home, "hypr/after.conf", "independent-new")
@@ -76,7 +80,7 @@ def test_deleted_tracked_file_comes_back_and_later_edits_stay():
             deleted = _write(home, "hypr/deleted.conf", "deleted-original")
             take_snapshot()
             deleted.unlink()
-            seal_session(active_session_path(snapshot_dir()))
+            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/deleted.conf"})
             kept.write_text("independent", encoding="utf-8")
             restore_snapshot()
             assert deleted.read_text(encoding="utf-8") == "deleted-original"
@@ -90,11 +94,11 @@ def test_followup_keeps_snapshot_and_skips_independent_edits():
             other = _write(home, "hypr/other.conf", "stable")
             take_snapshot()
             primary.write_text("v2", encoding="utf-8")
-            seal_session(active_session_path(snapshot_dir()))
+            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/primary.conf"})
             other.write_text("user-edit", encoding="utf-8")
             begin_followup_session()
             created = _write(home, "hypr/follow.conf", "from-continue")
-            seal_session(active_session_path(snapshot_dir()))
+            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/follow.conf"})
             other.write_text("still-user", encoding="utf-8")
             snapshot_copy = (snapshot_dir() / "files" / "hypr" / "primary.conf").read_text(encoding="utf-8")
             assert snapshot_copy == "v1"
@@ -211,11 +215,88 @@ def test_watch_seals_when_its_agent_window_closes():
                 clients,
                 known=set(),
                 sleep_fn=lambda _seconds: None,
+                observe_fn=lambda _clients: {"kitty/kitty.conf"},
             )
             other.write_text("independent-theme", encoding="utf-8")
             restore_snapshot()
             assert edited.read_text(encoding="utf-8") == "old"
             assert other.read_text(encoding="utf-8") == "independent-theme"
+
+
+def test_restore_keeps_a_file_changed_again_after_the_agent():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            edited = _write(home, "hypr/edited.conf", "original")
+            _write(home, "hypr/other.conf", "other")
+            take_snapshot()
+            edited.write_text("agent-version", encoding="utf-8")
+            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/edited.conf"})
+            edited.write_text("user-version", encoding="utf-8")
+            conflicts = restore_snapshot()
+            assert edited.read_text(encoding="utf-8") == "user-version"
+            assert conflicts == ["hypr/edited.conf"]
+
+
+def test_change_during_the_window_is_kept_unless_the_agent_touched_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            agent = _write(home, "hypr/agent.conf", "agent-original")
+            user = _write(home, "hypr/user.conf", "user-original")
+            take_snapshot()
+            agent.write_text("agent-edit", encoding="utf-8")
+            user.write_text("user-during", encoding="utf-8")
+            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/agent.conf"})
+            assert restore_snapshot() == []
+            assert agent.read_text(encoding="utf-8") == "agent-original"
+            assert user.read_text(encoding="utf-8") == "user-during"
+
+
+def test_agent_process_fds_do_not_include_other_files(tmp_path=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            agent = _write(home, "hypr/agent.conf", "agent")
+            _write(home, "hypr/user.conf", "user")
+            proc = Path(tmp) / "proc"
+            parent = proc / "4242"
+            child = proc / "4243"
+            (parent / "fd").mkdir(parents=True)
+            (child / "fd").mkdir(parents=True)
+            (parent / "stat").write_text("4242 (foot) S 1 0\n", encoding="utf-8")
+            (child / "stat").write_text("4243 (claude) S 4242 0\n", encoding="utf-8")
+            os_symlink = __import__("os").symlink
+            os_symlink(str(agent.resolve()), child / "fd" / "4")
+            os_symlink(str(agent.resolve()) + ".tmp", child / "fd" / "5")
+            clients = [{"class": "org.omarchy.agent", "pid": 4242, "address": "0x1"}]
+            assert files_touched_by_clients(clients, proc_root=proc) == {"hypr/agent.conf"}
+
+
+def test_metadata_save_failure_keeps_the_previous_restore_point():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            target = _write(home, "hypr/a.conf", "v1")
+            _record(home, "first", snapshot=True)
+            target.write_text("v2", encoding="utf-8")
+            original = session.save_last
+
+            def boom(update, keep_undo=False):
+                raise OSError("metadata")
+
+            session.save_last = boom
+            try:
+                try:
+                    _record(home, "SECOND-PROMPT", snapshot=True)
+                except OSError as exc:
+                    assert "metadata" in str(exc)
+                else:
+                    raise AssertionError("metadata save should have failed")
+            finally:
+                session.save_last = original
+            last = load_last()
+            assert last["prompt"] == "first"
+            assert last["canUndo"] is True
+            assert (snapshot_dir() / "files" / "hypr" / "a.conf").read_text(encoding="utf-8") == "v1"
+            names = [path.name for path in snapshot_dir().parent.iterdir()]
+            assert not any(name.startswith(".snapshot-") for name in names)
 
 
 def test_existing_agent_window_does_not_seal_this_edit():

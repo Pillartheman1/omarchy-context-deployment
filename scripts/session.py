@@ -87,7 +87,10 @@ def save_last(update: dict, *, keep_undo: bool = False) -> dict:
             data["snapshotAt"] = snapshot_at
         if can_undo_flag is not None and "canUndo" not in update:
             data["canUndo"] = can_undo_flag
-    last_path().write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    target = last_path()
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, target)
     return data
 
 
@@ -236,11 +239,11 @@ def session_lock():
         handle.close()
 
 
-def publish_snapshot(staging: Path) -> None:
-    """Swap the staging snapshot in only after it is complete.
+def publish_snapshot(staging: Path) -> Path | None:
+    """Swap in a finished snapshot. Return the previous directory, still on disk.
 
-    The previous restore point is moved aside and put back if the swap fails,
-    so a failed snapshot cannot destroy it.
+    The caller deletes that backup only after session metadata is saved. A failed
+    swap puts the previous directory back.
     """
     target = snapshot_dir()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -259,11 +262,31 @@ def publish_snapshot(staging: Path) -> None:
                 except OSError:
                     pass
             raise
-        if moved and backup.exists():
-            shutil.rmtree(backup)
+    if moved and backup.exists():
+        return backup
+    return None
 
 
-def take_snapshot() -> Path:
+def discard_backup(backup: Path | None) -> None:
+    if backup is not None and backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def rollback_backup(backup: Path | None) -> None:
+    """Put the previous restore point back. Used when metadata never commits."""
+    if backup is None or not backup.exists():
+        return
+    target = snapshot_dir()
+    with session_lock():
+        if not backup.exists():
+            return
+        if target.exists():
+            shutil.rmtree(target)
+        _rename(backup, target)
+
+
+def stage_snapshot() -> tuple[Path, Path | None]:
+    """Publish a snapshot and keep the previous restore point until the caller commits."""
     parent = snapshot_dir().parent
     parent.mkdir(parents=True, exist_ok=True)
     staging = parent / f".snapshot-staging-{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -272,37 +295,81 @@ def take_snapshot() -> Path:
     staging.mkdir(parents=True)
     try:
         populate_snapshot(staging)
-        publish_snapshot(staging)
+        backup = publish_snapshot(staging)
     except Exception:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
         raise
-    return snapshot_dir()
+    return snapshot_dir(), backup
 
 
-def read_changes(path: Path) -> list[str]:
+def take_snapshot() -> Path:
+    snap, backup = stage_snapshot()
+    discard_backup(backup)
+    return snap
+
+
+def read_change_file(path: Path) -> dict:
     if not path.is_file():
-        return []
+        return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return []
-    paths = data.get("paths") if isinstance(data, dict) else None
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_records(path: Path) -> dict[str, dict]:
+    """Map a tracked path to the bytes before the edit and the bytes the agent left."""
+    data = read_change_file(path)
+    files = data.get("files")
+    records: dict[str, dict] = {}
+    if isinstance(files, dict):
+        for rel, record in files.items():
+            if not isinstance(rel, str) or not safe_rel(rel) or not isinstance(record, dict):
+                continue
+            records[rel] = {
+                "before": record.get("before") if isinstance(record.get("before"), str) else None,
+                "after": record.get("after") if isinstance(record.get("after"), str) else None,
+            }
+    return records
+
+
+def read_changes(path: Path) -> list[str]:
+    records = read_records(path)
+    if records:
+        return sorted(records)
+    data = read_change_file(path)
+    paths = data.get("paths")
     if not isinstance(paths, list):
         return []
     return [item for item in paths if isinstance(item, str) and safe_rel(item)]
 
 
-def seal_session(session_path: Path) -> list[str]:
-    """Record files that differ from this edit's baseline and stop tracking it.
+def snapshot_manifest_files(snap: Path) -> dict:
+    try:
+        data = json.loads((snap / "meta" / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    files = data.get("files") if isinstance(data, dict) else None
+    return files if isinstance(files, dict) else {}
 
-    Later edits are not added. Restore uses the union of sealed sessions, so a
-    follow-up can add its own files without reverting unrelated ones.
+
+def write_records(path: Path, records: dict[str, dict]) -> None:
+    _write_json(path, {"paths": sorted(records), "files": records})
+
+
+def seal_session(session_path: Path, attributed: set[str] | None = None) -> list[str]:
+    """Record files the agent touched and the bytes it left behind.
+
+    `attributed` is the set the watcher observed. Paths outside that set stay
+    out of the undo, even if they changed while the agent window was open.
     """
     if not session_path.is_file():
         return []
     snap = session_path.parents[2]
     changes_path = snap / "meta" / "changes.json"
+    owned = {rel for rel in (attributed or set()) if isinstance(rel, str) and safe_rel(rel)}
     with session_lock():
         if not session_path.is_file():
             return []
@@ -312,17 +379,31 @@ def seal_session(session_path: Path) -> list[str]:
             raise RuntimeError("undo session is unreadable") from exc
         if not isinstance(data, dict):
             raise RuntimeError("undo session is unreadable")
-        existing = read_changes(changes_path)
+        records = read_records(changes_path)
         if data.get("sealed"):
-            return existing
-        baseline = {"files": data.get("baseline") or {}}
-        changed = changed_paths(baseline, collect_manifest())
+            return sorted(records)
+        stored = {
+            item
+            for item in (data.get("observed") or [])
+            if isinstance(item, str) and safe_rel(item)
+        }
+        owned = stored if attributed is None else stored | owned
+        live = collect_manifest()["files"]
+        manifest = snapshot_manifest_files(snap)
+        for rel in sorted(owned):
+            after = live.get(rel) if isinstance(live.get(rel), str) else None
+            if rel in records:
+                records[rel]["after"] = after
+                continue
+            before = manifest.get(rel) if isinstance(manifest.get(rel), str) else None
+            if before == after:
+                continue
+            records[rel] = {"before": before, "after": after}
         data["sealed"] = True
-        data["changed"] = changed
+        data["changed"] = sorted(records)
         _write_json(session_path, data)
-        merged = sorted(set(existing) | set(changed))
-        _write_json(changes_path, {"paths": merged})
-        return merged
+        write_records(changes_path, records)
+        return sorted(records)
 
 
 def session_sealed(path: Path) -> bool:
@@ -380,17 +461,42 @@ def restore_rel(snap: Path, rel: str) -> None:
         dest.unlink()
 
 
-def restore_snapshot(last: dict | None = None) -> Path:
+def content_token(path: Path) -> str | None:
+    if path.is_symlink() or path.is_file():
+        return hash_file(path)
+    return None
+
+
+def restore_recorded(snap: Path, rel: str, record: dict) -> str | None:
+    """Put back one agent edit. Return the path when a newer edit is kept."""
+    if not safe_rel(rel):
+        return None
+    before = record.get("before") if isinstance(record.get("before"), str) else None
+    after = record.get("after") if isinstance(record.get("after"), str) else None
+    current = content_token(config_root() / rel)
+    if current == after:
+        restore_rel(snap, rel)
+        return None
+    if current == before:
+        return None
+    return rel
+
+
+def restore_snapshot(last: dict | None = None) -> list[str]:
+    """Restore the agent's edits. Paths in the result were left as they are now."""
     last = last if last is not None else load_last()
     path = Path(last.get("snapshotDir") or snapshot_dir())
     if not snapshot_exists({"snapshotDir": str(path)}):
         raise RuntimeError("no undo snapshot")
     if not (path / "meta" / "manifest.json").is_file():
         raise RuntimeError("undo snapshot has no file manifest")
-    # Close out any edit still open so its changes are included, then put back
-    # only those paths. Files the edit never touched stay as they are.
-    for rel in seal_unsealed(path):
-        restore_rel(path, rel)
+    seal_unsealed(path)
+    records = read_records(path / "meta" / "changes.json")
+    conflicts = []
+    for rel in sorted(records):
+        kept = restore_recorded(path, rel, records[rel])
+        if kept:
+            conflicts.append(kept)
     shell_json = config_root() / "omarchy/shell.json"
     if shell_json.exists():
         shell_json.touch()
@@ -398,7 +504,7 @@ def restore_snapshot(last: dict | None = None) -> Path:
         subprocess.run(["hyprctl", "reload"], check=False, capture_output=True)
     except OSError:
         pass
-    return path
+    return conflicts
 
 
 def record_session(
@@ -420,12 +526,22 @@ def record_session(
         "screenshot": screenshot,
         "canContinue": True,
     }
+    pause = os.environ.get("DESKTOP_CONTEXT_RECORD_PAUSE")
+    if pause:
+        time.sleep(float(pause))
     if snapshot:
-        snap = take_snapshot()
-        update["canUndo"] = True
-        update["snapshotDir"] = str(snap)
-        update["snapshotAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        return save_last(update, keep_undo=False)
+        backup = None
+        try:
+            snap, backup = stage_snapshot()
+            update["canUndo"] = True
+            update["snapshotDir"] = str(snap)
+            update["snapshotAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            saved = save_last(update, keep_undo=False)
+        except Exception:
+            rollback_backup(backup)
+            raise
+        discard_backup(backup)
+        return saved
     if mode == "continue" and can_undo():
         begin_followup_session(Path(load_last().get("snapshotDir") or snapshot_dir()))
     return save_last(update, keep_undo=True)
@@ -479,6 +595,140 @@ def agent_addresses(clients) -> set[str]:
     return found
 
 
+def read_ppid(stat_path: Path) -> int | None:
+    try:
+        text = stat_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    marker = text.rfind(")")
+    if marker < 0:
+        return None
+    fields = text[marker + 2 :].split()
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
+def descendant_pids(roots: set[int], proc_root: Path | None = None) -> set[int]:
+    proc_root = proc_root or Path("/proc")
+    children: dict[int, list[int]] = {}
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            ppid = read_ppid(entry / "stat")
+            if ppid is None:
+                continue
+            children.setdefault(ppid, []).append(int(entry.name))
+    seen = set(roots)
+    stack = list(roots)
+    while stack:
+        pid = stack.pop()
+        for child in children.get(pid, []):
+            if child not in seen:
+                seen.add(child)
+                stack.append(child)
+    return seen
+
+
+def tracked_index() -> dict[str, str]:
+    index = {}
+    for rel, path in iter_tracked():
+        try:
+            index[str(path.resolve())] = rel
+        except OSError:
+            index[str(path)] = rel
+    return index
+
+
+def rel_for_fd_target(target: str, index: dict[str, str]) -> str | None:
+    cleaned = target.split(" (deleted)", 1)[0]
+    if cleaned in index:
+        return index[cleaned]
+    for full, rel in index.items():
+        if cleaned.startswith(full + ".") or cleaned.startswith(full + "~"):
+            return rel
+    return None
+
+
+def open_tracked_files(pids: set[int], proc_root: Path | None = None, index: dict[str, str] | None = None) -> set[str]:
+    """Tracked files currently open by these processes, including temp siblings."""
+    proc_root = proc_root or Path("/proc")
+    index = tracked_index() if index is None else index
+    found: set[str] = set()
+    for pid in pids:
+        fd_dir = proc_root / str(pid) / "fd"
+        if not fd_dir.is_dir():
+            continue
+        try:
+            entries = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                target = os.readlink(entry)
+            except OSError:
+                continue
+            rel = rel_for_fd_target(target, index)
+            if rel:
+                found.add(rel)
+    return found
+
+
+def agent_window_pids(clients) -> set[int]:
+    pids = set()
+    if not isinstance(clients, list):
+        return pids
+    for client in clients:
+        if not isinstance(client, dict):
+            continue
+        classes = (client.get("class"), client.get("initialClass"))
+        if not any(item == AGENT_WINDOW_CLASS for item in classes):
+            continue
+        pid = client.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            continue
+        pids.add(pid)
+    return pids
+
+
+def files_touched_by_clients(clients, proc_root: Path | None = None) -> set[str]:
+    roots = agent_window_pids(clients)
+    if not roots:
+        return set()
+    return open_tracked_files(descendant_pids(roots, proc_root), proc_root)
+
+
+def remember_observed(session_path: Path, paths: set[str]) -> None:
+    if not paths or not session_path.is_file():
+        return
+    fresh = {rel for rel in paths if isinstance(rel, str) and safe_rel(rel)}
+    if not fresh:
+        return
+    with session_lock():
+        if not session_path.is_file():
+            return
+        try:
+            data = json.loads(session_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict) or data.get("sealed"):
+            return
+        current = {
+            item
+            for item in (data.get("observed") or [])
+            if isinstance(item, str) and safe_rel(item)
+        }
+        merged = current | fresh
+        if merged == current:
+            return
+        data["observed"] = sorted(merged)
+        _write_json(session_path, data)
+
+
 def watch_should_seal(known: set[str], seen: set[str], current: set[str]) -> tuple[set[str], bool]:
     """Seal after every agent window that appeared after `known` has closed."""
     seen = set(seen) | (set(current) - set(known))
@@ -495,19 +745,27 @@ def watch_until_done(
     sleep_fn=time.sleep,
     poll: float = 0.4,
     max_polls: int | None = None,
+    observe_fn=None,
 ) -> bool:
     if known is None:
         known = agent_addresses(clients_fn())
     seen: set[str] = set()
+    attributed: set[str] = set()
     polls = 0
     while session_path.exists() and not session_sealed(session_path):
         if max_polls is not None and polls >= max_polls:
             return False
         polls += 1
-        current = agent_addresses(clients_fn())
-        seen, done = watch_should_seal(known, seen, current)
+        clients = clients_fn()
+        if observe_fn is not None:
+            found = set(observe_fn(clients) or [])
+        else:
+            found = files_touched_by_clients(clients)
+        attributed |= found
+        remember_observed(session_path, found)
+        seen, done = watch_should_seal(known, seen, agent_addresses(clients))
         if done:
-            seal_session(session_path)
+            seal_session(session_path, attributed=attributed)
             return True
         sleep_fn(poll)
     return False
@@ -583,10 +841,12 @@ def main() -> int:
         return 0
     if args.cmd == "restore":
         try:
-            restore_snapshot()
+            conflicts = restore_snapshot()
         except Exception as exc:
             print(f"undo failed: {exc}", file=sys.stderr)
             return 1
+        for rel in conflicts:
+            sys.stdout.write(f"conflict: {rel}\n")
         save_last(
             {
                 "lastMode": "undo",
