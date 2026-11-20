@@ -5,6 +5,7 @@ import QtQuick
 import QtQuick.Window
 import qs.Commons
 import qs.Ui
+import "dictation.js" as Dictation
 
 Item {
   id: root
@@ -23,6 +24,9 @@ Item {
   property int screenshotGen: 0
   property string lastPrompt: ""
   property bool dictationEnabled: false
+  property bool dictationOwned: false
+  property bool dictationSawActive: false
+  property bool keepCapture: false
   property string voxtypeState: "idle"
   property int clickLocalX: 0
   property int clickLocalY: 0
@@ -56,7 +60,7 @@ Item {
   readonly property string actionScript: root.pluginDir + "/scripts/run-action.sh"
   readonly property string screenshotUrl: root.screenshotPath.length ? Util.fileUrl(root.screenshotPath) : ""
   readonly property string defaultContextPath: Quickshell.env("HOME") + "/.local/state/omarchy/desktop-context/context.json"
-  readonly property bool dictating: root.voxtypeState === "recording" || root.voxtypeState === "transcribing"
+  readonly property bool dictating: Dictation.isDictating(root.dictationOwned, root.voxtypeState)
   readonly property bool promptStep: root.step === "edit" || root.step === "continue"
 
   ListModel { id: actionModel }
@@ -69,7 +73,11 @@ Item {
       onRead: function(line) {
         try {
           var data = JSON.parse(String(line || ""))
-          root.voxtypeState = String(data.alt || data.class || "idle")
+          var state = String(data.alt || data.class || "idle")
+          var tracked = Dictation.ingest(root.dictationOwned, root.dictationSawActive, state)
+          root.dictationOwned = tracked.owned
+          root.dictationSawActive = tracked.sawActive
+          root.voxtypeState = state
         } catch (e) {}
       }
     }
@@ -124,6 +132,9 @@ Item {
 
   function applyPayload(next) {
     if (!next || typeof next !== "object") next = ({})
+    root.stopDictation()
+    root.discardCapture()
+    root.keepCapture = false
 
     var actions = Array.isArray(next.actions) && next.actions.length ? next.actions : root.defaultActions()
     actionModel.clear()
@@ -163,6 +174,8 @@ Item {
 
     if (next.lastPrompt !== undefined) root.lastPrompt = String(next.lastPrompt || "")
     if (next.dictation !== undefined) root.dictationEnabled = next.dictation === true
+    root.dictationOwned = false
+    root.dictationSawActive = false
     root.voxtypeState = "idle"
 
     if (next.local && next.local.x !== undefined) {
@@ -216,13 +229,29 @@ Item {
   }
 
   function stopDictation() {
-    if (!root.dictating) return
-    Quickshell.execDetached(["voxtype", "record", "cancel"])
-    root.voxtypeState = "idle"
+    var result = Dictation.cancelCommand(root.dictationOwned, root.dictationSawActive)
+    root.dictationOwned = result.owned
+    root.dictationSawActive = result.sawActive
+    if (result.command === "cancel") {
+      Quickshell.execDetached(["voxtype", "record", "cancel"])
+      root.voxtypeState = "idle"
+    }
+  }
+
+  function discardCapture() {
+    if (root.keepCapture) return
+    if (!root.contextPath.length || !root.pluginDir.length) return
+    Quickshell.execDetached([
+      "python3",
+      root.pluginDir + "/scripts/context.py",
+      "--discard",
+      root.contextPath
+    ])
   }
 
   function close() {
     root.stopDictation()
+    root.discardCapture()
     root.opened = false
     root.step = "menu"
     root.promptText = ""
@@ -276,6 +305,7 @@ Item {
 
   function runAction(args) {
     if (!root.pluginDir.length) return
+    root.keepCapture = true
     Util.execArgv([root.actionScript].concat(args))
   }
 
@@ -296,16 +326,19 @@ Item {
   function toggleDictation() {
     if (!root.dictationEnabled) return
     promptField.forceActiveFocus()
-    if (root.voxtypeState === "transcribing")
+    var result = Dictation.dictateCommand(root.dictationOwned, root.dictationSawActive, root.voxtypeState)
+    root.dictationOwned = result.owned
+    root.dictationSawActive = result.sawActive
+    if (result.command === "cancel")
       Quickshell.execDetached(["voxtype", "record", "cancel"])
-    else
+    else if (result.command === "toggle")
       Quickshell.execDetached(["voxtype", "record", "toggle"])
     Qt.callLater(function() { promptField.forceActiveFocus() })
   }
 
   function dictationLabel() {
-    if (root.voxtypeState === "recording") return "Stop dictation"
-    if (root.voxtypeState === "transcribing") return "Transcribing…"
+    if (root.dictationOwned && root.voxtypeState === "recording") return "Stop dictation"
+    if (root.dictationOwned && root.voxtypeState === "transcribing") return "Transcribing…"
     return "Dictate"
   }
 
@@ -573,7 +606,7 @@ Item {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "Restore config from before the last agent edit? This puts Hyprland and Omarchy files back to that snapshot."
+              text: "Restore the files the last agent edit changed? Other config edits are left alone."
               color: root.foreground
               opacity: 0.72
               font.family: root.fontFamily
