@@ -37,7 +37,7 @@ Then `hyprctl reload`. After plugin updates, run `omarchy restart shell` so the 
 | What is this? | Same context; agent explains, does not edit |
 | Dictate | Voxtype into the prompt (hidden if Voxtype is not installed) |
 | Continue | Follow-up with a new click (after the first Inspect or Edit) |
-| Undo last edit | Restore the last agent edit, and keep files changed again since then |
+| Undo last edit | Restore agent writes, and keep a file the agent did not write or that you changed again |
 
 Requires a default agent: `omarchy default agent <name>`.
 
