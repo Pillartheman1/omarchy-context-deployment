@@ -18,7 +18,9 @@ fi
 mode=$1
 shift
 
-prompt_file="$state_dir/prompt.md"
+action_id=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+mkdir -p "$state_dir/prompts"
+prompt_file="$state_dir/prompts/${action_id}.md"
 context_json="$state_dir/context.json"
 user_prompt=""
 last_prompt=""
@@ -37,10 +39,17 @@ inspect)
   context_json=${1:-"$state_dir/context.json"}
   ;;
 undo)
-  if python3 "$scripts_dir/session.py" restore; then
-    omarchy notification send -g "󰕍" "Context Deployment" "Restored the files changed by the last edit"
+  restore_out=$(mktemp)
+  if python3 "$scripts_dir/session.py" restore >"$restore_out"; then
+    if grep -q '^conflict:' "$restore_out"; then
+      omarchy notification send -g "󰕍" "Context Deployment" "Restored the last edit. Newer edits to some files were kept."
+    else
+      omarchy notification send -g "󰕍" "Context Deployment" "Restored the files changed by the last edit"
+    fi
+    rm -f "$restore_out"
     exit 0
   fi
+  rm -f "$restore_out"
   omarchy notification send -u critical -g "󰅚" "Context Deployment" "Undo failed. The last snapshot is unchanged."
   exit 1
   ;;
@@ -92,7 +101,7 @@ write_screenshot() {
 }
 
 start_watch() {
-  local ready="$state_dir/watch.ready"
+  local ready="$1"
   rm -f "$ready"
   setsid python3 "$scripts_dir/session.py" watch --ready "$ready" >/dev/null 2>&1 </dev/null &
   local _try
@@ -122,7 +131,7 @@ edit)
     write_screenshot
   } >"$prompt_file"
   record_or_stop --mode edit --prompt="$user_prompt" --context "$context_json" --snapshot
-  start_watch
+  start_watch "$state_dir/prompts/${action_id}.ready"
   exec "$scripts_dir/launch-agent.sh" "$prompt_file"
   ;;
 inspect)
@@ -161,7 +170,7 @@ continue)
     snapshot_flag=(--snapshot)
   fi
   record_or_stop --mode continue --prompt="$user_prompt" --context "$context_json" "${snapshot_flag[@]}"
-  start_watch
+  start_watch "$state_dir/prompts/${action_id}.ready"
   exec "$scripts_dir/launch-agent.sh" "$prompt_file"
   ;;
 esac

@@ -606,7 +606,7 @@ Item {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "Restore the files the last agent edit changed? Other config edits are left alone."
+              text: "Restore files from the last agent edit? Files you changed again are kept."
               color: root.foreground
               opacity: 0.72
               font.family: root.fontFamily
