@@ -22,6 +22,7 @@ from pathlib import Path
 # themes, and wallpapers so undo stays small and cannot overwrite this plugin.
 HYPR_EXCLUDES = ["*.bak", "*.bak.*"]
 AGENT_WINDOW_CLASS = "org.omarchy.agent"
+ACTION_ENV = "DESKTOP_CONTEXT_ACTION"
 
 
 def state_dir() -> Path:
@@ -748,6 +749,42 @@ def agent_write_observations(clients, proc_root: Path | None = None) -> dict[str
     return writable_observations(descendant_pids(roots, proc_root), proc_root)
 
 
+def live_pids(proc_root: Path) -> set[int]:
+    found = set()
+    if not proc_root.is_dir():
+        return found
+    for entry in proc_root.iterdir():
+        if entry.name.isdigit():
+            found.add(int(entry.name))
+    return found
+
+
+def environ_has_action(pid: int, action: str, proc_root: Path) -> bool:
+    if not action:
+        return False
+    try:
+        raw = (proc_root / str(pid) / "environ").read_bytes()
+    except OSError:
+        return False
+    needle = f"{ACTION_ENV}={action}".encode()
+    return needle in raw.split(b"\0")
+
+
+def update_action_tree(action: str, seen: set[int], proc_root: Path) -> tuple[set[int], set[int]]:
+    """Live PIDs for this action, and every PID ever identified as part of it.
+
+    A process counts when it carries this action's marker or descends from one
+    that did. Other agent windows are not included.
+    """
+    live = live_pids(proc_root)
+    marked = {pid for pid in live if environ_has_action(pid, action, proc_root)}
+    known = set(seen) | marked
+    if not known:
+        return set(), seen
+    current = descendant_pids(known, proc_root) & live
+    return current, known | current
+
+
 def normalize_observations(found) -> dict[str, str | None]:
     if isinstance(found, dict):
         observations = {}
@@ -800,16 +837,57 @@ def watch_should_seal(known: set[str], seen: set[str], current: set[str]) -> tup
     return seen, False
 
 
+def watch_action(
+    session_path: Path,
+    action: str,
+    proc_root: Path,
+    *,
+    sleep_fn=time.sleep,
+    poll: float = 0.4,
+    max_polls: int | None = None,
+) -> bool:
+    """Attribute writes from this action's process tree and seal when it exits."""
+    seen: set[int] = set()
+    started = False
+    polls = 0
+    while session_path.exists() and not session_sealed(session_path):
+        if max_polls is not None and polls >= max_polls:
+            return False
+        polls += 1
+        current, seen = update_action_tree(action, seen, proc_root)
+        if current:
+            started = True
+            remember_observed(session_path, writable_observations(current, proc_root))
+        if started and not current:
+            seal_session(session_path)
+            return True
+        sleep_fn(poll)
+    return False
+
+
 def watch_until_done(
     session_path: Path,
-    clients_fn,
+    clients_fn=None,
     *,
     known: set[str] | None = None,
     sleep_fn=time.sleep,
     poll: float = 0.4,
     max_polls: int | None = None,
     observe_fn=None,
+    action: str | None = None,
+    proc_root: Path | None = None,
 ) -> bool:
+    if action:
+        return watch_action(
+            session_path,
+            action,
+            proc_root or Path("/proc"),
+            sleep_fn=sleep_fn,
+            poll=poll,
+            max_polls=max_polls,
+        )
+    if clients_fn is None:
+        raise TypeError("clients_fn is required when no action id is given")
     if known is None:
         known = agent_addresses(clients_fn())
     seen: set[str] = set()
@@ -834,7 +912,10 @@ def watch_until_done(
     return False
 
 
-def watch(ready: str | None = None) -> int:
+def watch(ready: str | None = None, action: str | None = None) -> int:
+    if not action:
+        print("missing action id", file=sys.stderr)
+        return 1
     last = load_last()
     snap = Path(last.get("snapshotDir") or snapshot_dir())
     session_path = active_session_path(snap)
@@ -844,20 +925,11 @@ def watch(ready: str | None = None) -> int:
     pid_path = state_dir() / "watch.pid"
     pid_path.write_text(str(os.getpid()) + "\n", encoding="utf-8")
 
-    def clients():
-        try:
-            data = hyprctl_json("clients")
-        except (OSError, RuntimeError, json.JSONDecodeError):
-            return []
-        return data if isinstance(data, list) else []
-
     try:
-        # Record windows that already exist before the caller is told to launch.
-        known = agent_addresses(clients())
         if ready:
             Path(ready).parent.mkdir(parents=True, exist_ok=True)
             Path(ready).write_text("ready\n", encoding="utf-8")
-        watch_until_done(session_path, clients, known=known)
+        watch_until_done(session_path, action=action)
     finally:
         try:
             if pid_path.is_file() and pid_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
@@ -878,6 +950,7 @@ def main() -> int:
     sub.add_parser("can-undo")
     watch_cmd = sub.add_parser("watch")
     watch_cmd.add_argument("--ready")
+    watch_cmd.add_argument("--action")
 
     rec = sub.add_parser("record")
     rec.add_argument("--mode", required=True)
@@ -920,7 +993,7 @@ def main() -> int:
         )
         return 0
     if args.cmd == "watch":
-        return watch(args.ready)
+        return watch(args.ready, args.action)
     if args.cmd == "record":
         context_path = Path(args.context)
         caption, kind, screenshot = context_meta(context_path)

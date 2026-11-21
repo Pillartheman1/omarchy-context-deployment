@@ -102,8 +102,9 @@ write_screenshot() {
 
 start_watch() {
   local ready="$1"
+  local action="$2"
   rm -f "$ready"
-  setsid python3 "$scripts_dir/session.py" watch --ready "$ready" >/dev/null 2>&1 </dev/null &
+  setsid python3 "$scripts_dir/session.py" watch --ready "$ready" --action "$action" >/dev/null 2>&1 </dev/null &
   local _try
   for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     [[ -f $ready ]] && break
@@ -131,7 +132,8 @@ edit)
     write_screenshot
   } >"$prompt_file"
   record_or_stop --mode edit --prompt="$user_prompt" --context "$context_json" --snapshot
-  start_watch "$state_dir/prompts/${action_id}.ready"
+  start_watch "$state_dir/prompts/${action_id}.ready" "$action_id"
+  export DESKTOP_CONTEXT_ACTION="$action_id"
   exec "$scripts_dir/launch-agent.sh" "$prompt_file"
   ;;
 inspect)
@@ -144,6 +146,7 @@ inspect)
     write_screenshot
   } >"$prompt_file"
   python3 "$scripts_dir/session.py" record --mode inspect --prompt="What is this?" --context "$context_json"
+  export DESKTOP_CONTEXT_ACTION="$action_id"
   exec "$scripts_dir/launch-agent.sh" "$prompt_file"
   ;;
 continue)
@@ -170,7 +173,8 @@ continue)
     snapshot_flag=(--snapshot)
   fi
   record_or_stop --mode continue --prompt="$user_prompt" --context "$context_json" "${snapshot_flag[@]}"
-  start_watch "$state_dir/prompts/${action_id}.ready"
+  start_watch "$state_dir/prompts/${action_id}.ready" "$action_id"
+  export DESKTOP_CONTEXT_ACTION="$action_id"
   exec "$scripts_dir/launch-agent.sh" "$prompt_file"
   ;;
 esac
