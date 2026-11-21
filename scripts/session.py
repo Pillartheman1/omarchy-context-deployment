@@ -214,7 +214,7 @@ def _write_json(path: Path, payload) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def populate_snapshot(staging: Path) -> dict:
+def populate_snapshot(staging: Path) -> str:
     manifest = collect_manifest()
     if not manifest["files"]:
         raise RuntimeError("nothing to snapshot")
@@ -229,37 +229,48 @@ def populate_snapshot(staging: Path) -> dict:
         meta / "sessions" / f"{sid}.json",
         {"id": sid, "baseline": manifest["files"], "sealed": False},
     )
-    (meta / "active-session").write_text(sid + "\n", encoding="utf-8")
-    return manifest
+    return sid
 
 
 def _rename(src: Path, dst: Path) -> None:
     src.rename(dst)
 
 
+_LOCK_DEPTH = 0
+_LOCK_HANDLE = None
+
+
 @contextlib.contextmanager
 def session_lock():
-    state_dir().mkdir(parents=True, exist_ok=True)
-    handle = open(state_dir() / "session.lock", "a+", encoding="utf-8")
-    try:
+    """Cross-process lock. Re-entrant in this process so nested steps cannot deadlock."""
+    global _LOCK_DEPTH, _LOCK_HANDLE
+    if _LOCK_DEPTH == 0:
+        state_dir().mkdir(parents=True, exist_ok=True)
+        handle = open(state_dir() / "session.lock", "a+", encoding="utf-8")
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _LOCK_HANDLE = handle
+    _LOCK_DEPTH += 1
+    try:
         yield
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        _LOCK_DEPTH -= 1
+        if _LOCK_DEPTH == 0 and _LOCK_HANDLE is not None:
+            fcntl.flock(_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+            _LOCK_HANDLE.close()
+            _LOCK_HANDLE = None
 
 
-def build_staging() -> Path:
+def build_staging() -> tuple[Path, str]:
     parent = state_dir() / "undo"
     parent.mkdir(parents=True, exist_ok=True)
     staging = parent / f".staging-{new_id()}"
     staging.mkdir()
     try:
-        populate_snapshot(staging)
+        sid = populate_snapshot(staging)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    return staging
+    return staging, sid
 
 
 def _paths_match(left, right) -> bool:
@@ -271,11 +282,12 @@ def _paths_match(left, right) -> bool:
         return str(left) == str(right)
 
 
-def activate_generation(staging: Path, update: dict | None) -> dict:
+def activate_generation(staging: Path, sid: str, update: dict | None) -> dict:
     """Publish one snapshot directory that already holds its session metadata.
 
     The previous generation is never moved. A failed pointer update deletes only
     this directory, so another edit's published snapshot stays in place.
+    The returned sessionPath is for this generation only and is not a lookup key.
     """
     final = generations_root() / new_id()
     record = dict(load_last())
@@ -294,27 +306,34 @@ def activate_generation(staging: Path, update: dict | None) -> dict:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
         raise
+    session_path = final / "meta" / "sessions" / f"{sid}.json"
     try:
         if update is None:
-            return save_last({"snapshotDir": str(final)}, keep_undo=True)
-        return save_last(
-            {
-                **update,
-                "canUndo": True,
-                "snapshotDir": str(final),
-                "snapshotAt": record["snapshotAt"],
-            },
-            keep_undo=False,
-        )
+            saved = save_last({"snapshotDir": str(final)}, keep_undo=True)
+        else:
+            saved = save_last(
+                {
+                    **update,
+                    "canUndo": True,
+                    "snapshotDir": str(final),
+                    "snapshotAt": record["snapshotAt"],
+                },
+                keep_undo=False,
+            )
     except Exception:
         if not _paths_match(load_last().get("snapshotDir"), final):
             shutil.rmtree(final, ignore_errors=True)
         raise
+    saved = dict(saved)
+    saved["sessionPath"] = str(session_path)
+    return saved
 
 
-def take_snapshot() -> Path:
+def take_snapshot() -> tuple[Path, Path]:
     with session_lock():
-        return Path(activate_generation(build_staging(), None)["snapshotDir"])
+        staging, sid = build_staging()
+        saved = activate_generation(staging, sid, None)
+        return Path(saved["snapshotDir"]), Path(saved["sessionPath"])
 
 
 def read_change_file(path: Path) -> dict:
@@ -433,27 +452,14 @@ def seal_unsealed(snap: Path) -> list[str]:
     return read_changes(snap / "meta" / "changes.json")
 
 
-def active_session_path(snap: Path) -> Path | None:
-    pointer = snap / "meta" / "active-session"
-    if not pointer.is_file():
-        return None
-    sid = pointer.read_text(encoding="utf-8").strip()
-    if not sid or not safe_rel(sid) or "/" in sid:
-        return None
-    path = snap / "meta" / "sessions" / f"{sid}.json"
-    return path if path.is_file() else None
-
-
-def begin_followup_session(snap: Path | None = None) -> Path:
-    """Track a Continue against the current files without replacing the snapshot."""
-    snap = snap or snapshot_dir()
+def begin_followup_session(snap: Path) -> Path:
+    """Open another session file inside an existing snapshot. The caller keeps the path."""
     if not (snap / "meta" / "manifest.json").is_file():
         raise RuntimeError("undo snapshot has no manifest")
     live = collect_manifest()
     sid = new_id()
     path = snap / "meta" / "sessions" / f"{sid}.json"
     _write_json(path, {"id": sid, "baseline": live["files"], "sealed": False})
-    (snap / "meta" / "active-session").write_text(sid + "\n", encoding="utf-8")
     return path
 
 
@@ -542,10 +548,20 @@ def record_session(
         time.sleep(float(pause))
     if snapshot:
         with session_lock():
-            return activate_generation(build_staging(), update)
-    if mode == "continue" and can_undo():
-        begin_followup_session(Path(load_last().get("snapshotDir") or snapshot_dir()))
-    return save_last(update, keep_undo=True)
+            staging, sid = build_staging()
+            return activate_generation(staging, sid, update)
+    if mode == "continue":
+        with session_lock():
+            if not can_undo():
+                raise RuntimeError("continue has no restore point")
+            snap = Path(str(load_last().get("snapshotDir") or ""))
+            session_path = begin_followup_session(snap)
+            saved = dict(save_last(update, keep_undo=True))
+            saved["sessionPath"] = str(session_path)
+            return saved
+    saved = dict(save_last(update, keep_undo=True))
+    saved["sessionPath"] = ""
+    return saved
 
 
 def context_meta(context_path: Path) -> tuple[str, str, str]:
@@ -912,15 +928,18 @@ def watch_until_done(
     return False
 
 
-def watch(ready: str | None = None, action: str | None = None) -> int:
-    if not action:
-        print("missing action id", file=sys.stderr)
+def watch(ready: str | None = None, action: str | None = None, session: str | None = None) -> int:
+    if not action or not session:
+        print("missing action id or session path", file=sys.stderr)
         return 1
-    last = load_last()
-    snap = Path(last.get("snapshotDir") or snapshot_dir())
-    session_path = active_session_path(snap)
-    if session_path is None:
-        print("no active undo session", file=sys.stderr)
+    session_path = Path(session)
+    try:
+        session_path.resolve().relative_to(generations_root().resolve())
+    except (OSError, ValueError):
+        print("session is outside the undo store", file=sys.stderr)
+        return 1
+    if not session_path.is_file():
+        print("session file is missing", file=sys.stderr)
         return 1
     pid_path = state_dir() / "watch.pid"
     pid_path.write_text(str(os.getpid()) + "\n", encoding="utf-8")
@@ -951,6 +970,7 @@ def main() -> int:
     watch_cmd = sub.add_parser("watch")
     watch_cmd.add_argument("--ready")
     watch_cmd.add_argument("--action")
+    watch_cmd.add_argument("--session")
 
     rec = sub.add_parser("record")
     rec.add_argument("--mode", required=True)
@@ -969,7 +989,7 @@ def main() -> int:
         return 0 if can_undo() else 1
     if args.cmd == "snapshot":
         try:
-            path = take_snapshot()
+            path, _session = take_snapshot()
         except Exception as exc:
             print(f"snapshot failed: {exc}", file=sys.stderr)
             return 1
@@ -977,28 +997,29 @@ def main() -> int:
         return 0
     if args.cmd == "restore":
         try:
-            conflicts = restore_snapshot()
+            with session_lock():
+                conflicts = restore_snapshot()
+                save_last(
+                    {
+                        "lastMode": "undo",
+                        "canContinue": False,
+                        "canUndo": False,
+                    },
+                    keep_undo=True,
+                )
         except Exception as exc:
             print(f"undo failed: {exc}", file=sys.stderr)
             return 1
         for rel in conflicts:
             sys.stdout.write(f"conflict: {rel}\n")
-        save_last(
-            {
-                "lastMode": "undo",
-                "canContinue": False,
-                "canUndo": False,
-            },
-            keep_undo=True,
-        )
         return 0
     if args.cmd == "watch":
-        return watch(args.ready, args.action)
+        return watch(args.ready, args.action, args.session)
     if args.cmd == "record":
         context_path = Path(args.context)
         caption, kind, screenshot = context_meta(context_path)
         try:
-            record_session(
+            saved = record_session(
                 mode=args.mode,
                 prompt=args.prompt,
                 caption=caption,
@@ -1010,6 +1031,9 @@ def main() -> int:
         except Exception as exc:
             print(f"snapshot failed: {exc}", file=sys.stderr)
             return 1
+        session_path = str(saved.get("sessionPath") or "")
+        if session_path:
+            sys.stdout.write(session_path + "\n")
         return 0
     return 1
 

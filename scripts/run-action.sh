@@ -103,8 +103,9 @@ write_screenshot() {
 start_watch() {
   local ready="$1"
   local action="$2"
+  local session="$3"
   rm -f "$ready"
-  setsid python3 "$scripts_dir/session.py" watch --ready "$ready" --action "$action" >/dev/null 2>&1 </dev/null &
+  setsid python3 "$scripts_dir/session.py" watch --ready "$ready" --action "$action" --session "$session" >/dev/null 2>&1 </dev/null &
   local _try
   for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     [[ -f $ready ]] && break
@@ -113,11 +114,16 @@ start_watch() {
 }
 
 record_or_stop() {
-  if python3 "$scripts_dir/session.py" record "$@"; then
-    return 0
+  local out
+  if ! out=$(python3 "$scripts_dir/session.py" record "$@"); then
+    omarchy notification send -u critical -g "󰅚" "Context Deployment" "Could not save a restore point, so the edit was not started." || true
+    exit 1
   fi
-  omarchy notification send -u critical -g "󰅚" "Context Deployment" "Could not save a restore point, so the edit was not started." || true
-  exit 1
+  session_path=$out
+  if [[ ! -f $session_path ]]; then
+    echo "record did not return its session file" >&2
+    exit 1
+  fi
 }
 
 case "$mode" in
@@ -132,7 +138,7 @@ edit)
     write_screenshot
   } >"$prompt_file"
   record_or_stop --mode edit --prompt="$user_prompt" --context "$context_json" --snapshot
-  start_watch "$state_dir/prompts/${action_id}.ready" "$action_id"
+  start_watch "$state_dir/prompts/${action_id}.ready" "$action_id" "$session_path"
   export DESKTOP_CONTEXT_ACTION="$action_id"
   exec "$scripts_dir/launch-agent.sh" "$prompt_file"
   ;;
@@ -173,7 +179,7 @@ continue)
     snapshot_flag=(--snapshot)
   fi
   record_or_stop --mode continue --prompt="$user_prompt" --context "$context_json" "${snapshot_flag[@]}"
-  start_watch "$state_dir/prompts/${action_id}.ready" "$action_id"
+  start_watch "$state_dir/prompts/${action_id}.ready" "$action_id" "$session_path"
   export DESKTOP_CONTEXT_ACTION="$action_id"
   exec "$scripts_dir/launch-agent.sh" "$prompt_file"
   ;;
