@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "daniel.desktop-context",
   "name": "Context Deployment",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "author": "Daniel Klabunde",
   "license": "MIT",
   "description": "Super+right-click at the cursor to edit the desktop with your default agent.",

@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import session  # noqa: E402
 from isolate import isolated_home, run_module  # noqa: E402
 from session import (  # noqa: E402
-    active_session_path,
     agent_addresses,
     begin_followup_session,
     files_touched_by_clients,
@@ -57,11 +56,11 @@ def test_restore_reverts_only_files_changed_before_seal():
             edited = _write(home, "hypr/edited.conf", "original-edited")
             untouched = _write(home, "hypr/untouched.conf", "original-untouched")
             backup = _write(home, "hypr/local.bak", "keep-bak")
-            take_snapshot()
+            _generation, session = take_snapshot()
             edited.write_text("agent-edit", encoding="utf-8")
             created = _write(home, "hypr/created.conf", "agent-created")
             seal_session(
-                active_session_path(snapshot_dir()),
+                session,
                 attributed={"hypr/edited.conf", "hypr/created.conf"},
             )
             untouched.write_text("independent-later", encoding="utf-8")
@@ -80,9 +79,9 @@ def test_deleted_tracked_file_comes_back_and_later_edits_stay():
         with isolated_home(Path(tmp)) as home:
             kept = _write(home, "hypr/kept.conf", "kept-original")
             deleted = _write(home, "hypr/deleted.conf", "deleted-original")
-            take_snapshot()
+            _generation, session = take_snapshot()
             deleted.unlink()
-            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/deleted.conf"})
+            seal_session(session, attributed={"hypr/deleted.conf"})
             kept.write_text("independent", encoding="utf-8")
             restore_snapshot()
             assert deleted.read_text(encoding="utf-8") == "deleted-original"
@@ -94,13 +93,13 @@ def test_followup_keeps_snapshot_and_skips_independent_edits():
         with isolated_home(Path(tmp)) as home:
             primary = _write(home, "hypr/primary.conf", "v1")
             other = _write(home, "hypr/other.conf", "stable")
-            take_snapshot()
+            generation, session = take_snapshot()
             primary.write_text("v2", encoding="utf-8")
-            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/primary.conf"})
+            seal_session(session, attributed={"hypr/primary.conf"})
             other.write_text("user-edit", encoding="utf-8")
-            begin_followup_session()
+            follow = begin_followup_session(generation)
             created = _write(home, "hypr/follow.conf", "from-continue")
-            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/follow.conf"})
+            seal_session(follow, attributed={"hypr/follow.conf"})
             other.write_text("still-user", encoding="utf-8")
             snapshot_copy = (snapshot_dir() / "files" / "hypr" / "primary.conf").read_text(encoding="utf-8")
             assert snapshot_copy == "v1"
@@ -193,7 +192,7 @@ def test_watch_seals_when_its_agent_window_closes():
         with isolated_home(Path(tmp)) as home:
             edited = _write(home, "kitty/kitty.conf", "old")
             other = _write(home, "kitty/theme.conf", "theme")
-            take_snapshot()
+            _generation, session = take_snapshot()
             edited.write_text("new", encoding="utf-8")
             frames = [
                 [{"class": "org.omarchy.agent", "address": "0xagent"}],
@@ -208,7 +207,7 @@ def test_watch_seals_when_its_agent_window_closes():
                 return frame
 
             assert watch_until_done(
-                active_session_path(snapshot_dir()),
+                session,
                 clients,
                 known=set(),
                 sleep_fn=lambda _seconds: None,
@@ -225,9 +224,9 @@ def test_restore_keeps_a_file_changed_again_after_the_agent():
         with isolated_home(Path(tmp)) as home:
             edited = _write(home, "hypr/edited.conf", "original")
             _write(home, "hypr/other.conf", "other")
-            take_snapshot()
+            _generation, session = take_snapshot()
             edited.write_text("agent-version", encoding="utf-8")
-            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/edited.conf"})
+            seal_session(session, attributed={"hypr/edited.conf"})
             edited.write_text("user-version", encoding="utf-8")
             conflicts = restore_snapshot()
             assert edited.read_text(encoding="utf-8") == "user-version"
@@ -239,10 +238,10 @@ def test_change_during_the_window_is_kept_unless_the_agent_touched_it():
         with isolated_home(Path(tmp)) as home:
             agent = _write(home, "hypr/agent.conf", "agent-original")
             user = _write(home, "hypr/user.conf", "user-original")
-            take_snapshot()
+            _generation, session = take_snapshot()
             agent.write_text("agent-edit", encoding="utf-8")
             user.write_text("user-during", encoding="utf-8")
-            seal_session(active_session_path(snapshot_dir()), attributed={"hypr/agent.conf"})
+            seal_session(session, attributed={"hypr/agent.conf"})
             assert restore_snapshot() == []
             assert agent.read_text(encoding="utf-8") == "agent-original"
             assert user.read_text(encoding="utf-8") == "user-during"
@@ -322,9 +321,9 @@ def test_unidentified_writer_is_left_out_of_undo():
     with tempfile.TemporaryDirectory() as tmp:
         with isolated_home(Path(tmp)) as home:
             edited = _write(home, "hypr/edited.conf", "original")
-            take_snapshot()
+            _generation, session = take_snapshot()
             edited.write_text("user-only", encoding="utf-8")
-            seal_session(active_session_path(snapshot_dir()))
+            seal_session(session)
             assert restore_snapshot() == []
             assert edited.read_text(encoding="utf-8") == "user-only"
 
@@ -333,7 +332,7 @@ def test_user_edit_before_close_is_kept():
     with tempfile.TemporaryDirectory() as tmp:
         with isolated_home(Path(tmp)) as home:
             edited = _write(home, "hypr/edited.conf", "original")
-            take_snapshot()
+            _generation, edit_session = take_snapshot()
             edited.write_text("agent-version", encoding="utf-8")
             agent_hash = session.content_token(edited)
             state = {"n": 0}
@@ -352,7 +351,7 @@ def test_user_edit_before_close_is_kept():
                 return {}
 
             assert watch_until_done(
-                active_session_path(snapshot_dir()),
+                edit_session,
                 clients,
                 known=set(),
                 sleep_fn=lambda _seconds: None,
@@ -373,9 +372,10 @@ def test_overlapping_metadata_failure_keeps_the_other_edit():
             def hook(update, keep_undo=False):
                 session.save_last = original
                 target.write_text("v-other", encoding="utf-8")
-                staging = session.build_staging()
+                staging, sid = session.build_staging()
                 session.activate_generation(
                     staging,
+                    sid,
                     {
                         "lastMode": "edit",
                         "prompt": "other-edit",
@@ -421,7 +421,7 @@ def test_preexisting_agent_write_is_not_recorded():
         with isolated_home(Path(tmp)) as home:
             ours = _write(home, "hypr/ours.conf", "original-ours")
             theirs = _write(home, "hypr/theirs.conf", "original-theirs")
-            take_snapshot()
+            _generation, edit_session = take_snapshot()
             ours.write_text("our-edit", encoding="utf-8")
             theirs.write_text("their-edit", encoding="utf-8")
             proc = Path(tmp) / "proc"
@@ -444,7 +444,7 @@ def test_preexisting_agent_write_is_not_recorded():
                         shutil.rmtree(path)
 
             assert watch_until_done(
-                active_session_path(snapshot_dir()),
+                edit_session,
                 action=action,
                 proc_root=proc,
                 sleep_fn=retire,
@@ -458,13 +458,13 @@ def test_tracking_stops_only_when_this_action_exits():
     with tempfile.TemporaryDirectory() as tmp:
         with isolated_home(Path(tmp)) as home:
             edited = _write(home, "hypr/edited.conf", "original")
-            take_snapshot()
+            _generation, edit_session = take_snapshot()
             edited.write_text("other-session", encoding="utf-8")
             proc = Path(tmp) / "proc"
             _fake_proc(proc, 10, 1, b"HOME=/tmp\0DESKTOP_CONTEXT_ACTION=someone-else\0", [(4, edited.resolve(), "0100001")])
             assert (
                 watch_until_done(
-                    active_session_path(snapshot_dir()),
+                    edit_session,
                     action="action-new",
                     proc_root=proc,
                     sleep_fn=lambda _seconds: None,
@@ -472,9 +472,67 @@ def test_tracking_stops_only_when_this_action_exits():
                 )
                 is False
             )
-            assert not session.session_sealed(active_session_path(snapshot_dir()))
+            assert not session.session_sealed(edit_session)
             assert restore_snapshot() == []
             assert edited.read_text(encoding="utf-8") == "other-session"
+
+
+def test_second_save_does_not_capture_the_first_watcher():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            tracked = _write(home, "hypr/tracked.conf", "base")
+            context = home / "context.json"
+            context.write_text('{"caption": "Desk", "kind": "desktop"}\n', encoding="utf-8")
+
+            def record(prompt):
+                return record_session(
+                    mode="edit",
+                    prompt=prompt,
+                    caption="Desk",
+                    kind="desktop",
+                    context_path=str(context),
+                    screenshot="",
+                    snapshot=True,
+                )
+
+            first = record("first-edit")
+            tracked.write_text("after-first", encoding="utf-8")
+            second = record("second-edit")
+            first_session = Path(first["sessionPath"])
+            second_session = Path(second["sessionPath"])
+            assert first_session != second_session
+            assert load_last()["snapshotDir"] == str(second_session.parents[2])
+            assert load_last()["prompt"] == "second-edit"
+            tracked.write_text("written-by-first-agent", encoding="utf-8")
+            proc = Path(tmp) / "proc"
+            _fake_proc(
+                proc,
+                30,
+                1,
+                b"DESKTOP_CONTEXT_ACTION=action-first\0",
+                [(4, tracked.resolve(), "0100001")],
+            )
+
+            def retire(_seconds):
+                path = proc / "30"
+                if path.exists():
+                    shutil.rmtree(path)
+
+            assert watch_until_done(
+                first_session,
+                action="action-first",
+                proc_root=proc,
+                sleep_fn=retire,
+            )
+            first_changes = (first_session.parents[2] / "meta" / "changes.json").read_text(encoding="utf-8")
+            second_changes = (second_session.parents[2] / "meta" / "changes.json").read_text(encoding="utf-8")
+            assert "hypr/tracked.conf" in first_changes
+            assert "hypr/tracked.conf" not in second_changes
+            assert "written-by-first-agent" == tracked.read_text(encoding="utf-8")
+            # Undoing the second edit must not roll back the first action's write.
+            # The second snapshot's baseline is "after-first", and it recorded no writes.
+            assert restore_snapshot() == []
+            assert tracked.read_text(encoding="utf-8") == "written-by-first-agent"
 
 
 def test_existing_agent_window_does_not_seal_this_edit():
