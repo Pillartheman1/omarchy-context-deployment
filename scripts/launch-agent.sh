@@ -42,4 +42,8 @@ if omarchy-cmd-missing "$agent"; then
   exit 1
 fi
 
+# The watcher attributes writes only from this process and its descendants.
+if [[ -n ${DESKTOP_CONTEXT_ACTION:-} ]]; then
+  export DESKTOP_CONTEXT_ACTION
+fi
 exec omarchy-agent --prompt "$prompt"

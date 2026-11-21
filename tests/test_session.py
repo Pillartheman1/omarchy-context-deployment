@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -401,6 +403,78 @@ def test_overlapping_metadata_failure_keeps_the_other_edit():
             assert last["prompt"] == "other-edit"
             assert last["canUndo"] is True
             assert (snapshot_dir() / "files" / "hypr" / "a.conf").read_text(encoding="utf-8") == "v-other"
+
+
+def _fake_proc(proc: Path, pid: int, ppid: int, environ: bytes, fds=()) -> None:
+    base = proc / str(pid)
+    (base / "fd").mkdir(parents=True)
+    (base / "fdinfo").mkdir()
+    (base / "stat").write_text(f"{pid} (agent) S {ppid} 0\n", encoding="utf-8")
+    (base / "environ").write_bytes(environ)
+    for name, target, flags in fds:
+        os.symlink(str(target), base / "fd" / str(name))
+        (base / "fdinfo" / str(name)).write_text(f"flags:\t{flags}\n", encoding="utf-8")
+
+
+def test_preexisting_agent_write_is_not_recorded():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            ours = _write(home, "hypr/ours.conf", "original-ours")
+            theirs = _write(home, "hypr/theirs.conf", "original-theirs")
+            take_snapshot()
+            ours.write_text("our-edit", encoding="utf-8")
+            theirs.write_text("their-edit", encoding="utf-8")
+            proc = Path(tmp) / "proc"
+            action = "action-new"
+            write_flags = "0100001"
+            _fake_proc(proc, 10, 1, b"HOME=/tmp\0", [(4, theirs.resolve(), write_flags)])
+            _fake_proc(
+                proc,
+                20,
+                1,
+                f"DESKTOP_CONTEXT_ACTION={action}\0".encode(),
+                (),
+            )
+            _fake_proc(proc, 21, 20, b"HOME=/tmp\0", [(4, ours.resolve(), write_flags)])
+
+            def retire(_seconds):
+                for pid in (20, 21):
+                    path = proc / str(pid)
+                    if path.exists():
+                        shutil.rmtree(path)
+
+            assert watch_until_done(
+                active_session_path(snapshot_dir()),
+                action=action,
+                proc_root=proc,
+                sleep_fn=retire,
+            )
+            assert restore_snapshot() == []
+            assert ours.read_text(encoding="utf-8") == "original-ours"
+            assert theirs.read_text(encoding="utf-8") == "their-edit"
+
+
+def test_tracking_stops_only_when_this_action_exits():
+    with tempfile.TemporaryDirectory() as tmp:
+        with isolated_home(Path(tmp)) as home:
+            edited = _write(home, "hypr/edited.conf", "original")
+            take_snapshot()
+            edited.write_text("other-session", encoding="utf-8")
+            proc = Path(tmp) / "proc"
+            _fake_proc(proc, 10, 1, b"HOME=/tmp\0DESKTOP_CONTEXT_ACTION=someone-else\0", [(4, edited.resolve(), "0100001")])
+            assert (
+                watch_until_done(
+                    active_session_path(snapshot_dir()),
+                    action="action-new",
+                    proc_root=proc,
+                    sleep_fn=lambda _seconds: None,
+                    max_polls=3,
+                )
+                is False
+            )
+            assert not session.session_sealed(active_session_path(snapshot_dir()))
+            assert restore_snapshot() == []
+            assert edited.read_text(encoding="utf-8") == "other-session"
 
 
 def test_existing_agent_window_does_not_seal_this_edit():
